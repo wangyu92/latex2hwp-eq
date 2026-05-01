@@ -23,6 +23,7 @@ from hwpx_eq.hwpx_io.ns import (
     SZ_DEFAULTS,
 )
 from hwpx_eq.ir import Node
+from hwpx_eq.latex.extract import Equation, Segment, Text
 from hwpx_eq.latex.parse import parse as parse_latex
 
 DEFAULT_FONT_SIZE_PT = 10  # 한글 default body font size
@@ -74,6 +75,27 @@ def write_from_ir(
     )
 
 
+def write_mixed(
+    paragraphs: Iterable[Iterable[Segment]],
+    output_path: str,
+    font_size_pt: int = DEFAULT_FONT_SIZE_PT,
+    page_width_mm: float | None = None,
+) -> None:
+    """Write paragraphs of mixed Text/Equation segments to a .hwpx file.
+
+    Each input paragraph becomes one <hp:p>; each segment becomes one
+    <hp:run> child. Text runs hold a single <hp:t>; equation runs hold the
+    same <hp:equation> tree produced by `_build_equation`.
+    """
+    doc = _new_doc()
+    base_unit = _pt_to_base_unit(font_size_pt)
+    for segments in paragraphs:
+        _append_mixed_paragraph(doc, list(segments), base_unit=base_unit)
+    if page_width_mm is not None:
+        _set_page_width(doc, page_width_mm)
+    _save(doc, output_path)
+
+
 def _pt_to_base_unit(font_size_pt: int) -> int:
     """HWP baseUnit is in 1/100 pt. So 10pt -> 1000, 8pt -> 800, 15pt -> 1500."""
     return max(100, font_size_pt * 100)
@@ -107,6 +129,26 @@ def _append_equation_paragraph(doc: HwpxDocument, eqs: str, base_unit: int) -> N
         if not (t.text or "").strip():
             run.remove(t)
     run.append(_build_equation(eqs, base_unit=base_unit))
+
+
+def _append_mixed_paragraph(
+    doc: HwpxDocument, segments: list[Segment], base_unit: int
+) -> None:
+    p = doc.add_paragraph("")
+    # Replace the placeholder run(s) with our own.
+    for child in list(p.element):
+        p.element.remove(child)
+    for seg in segments:
+        run = etree.SubElement(p.element, f"{{{HP}}}run")
+        run.set("charPrIDRef", "0")
+        if isinstance(seg, Text):
+            t = etree.SubElement(run, f"{{{HP}}}t")
+            t.text = seg.content
+        elif isinstance(seg, Equation):
+            eqs = emit_eqs(parse_latex(seg.latex))
+            run.append(_build_equation(eqs, base_unit=base_unit))
+        else:
+            raise TypeError(f"unknown segment: {type(seg).__name__}")
 
 
 def _build_equation(eqs: str, base_unit: int) -> etree._Element:
