@@ -1,4 +1,12 @@
-from hwpx_eq.latex.extract import Equation, Text, extract, extract_segments
+from hwpx_eq.latex.extract import (
+    Equation,
+    Paragraph,
+    Table,
+    Text,
+    extract,
+    extract_blocks,
+    extract_segments,
+)
 
 
 def test_dollar_inline() -> None:
@@ -91,3 +99,70 @@ def test_segments_empty_input() -> None:
 
 def test_segments_whitespace_only_input() -> None:
     assert extract_segments("   \n\n   ") == []
+
+
+# -------- extract_blocks: tables --------
+
+
+def test_blocks_simple_table() -> None:
+    src = "| h1 | h2 |\n|---|---|\n| a | b |"
+    blocks = extract_blocks(src)
+    assert len(blocks) == 1
+    tbl = blocks[0]
+    assert isinstance(tbl, Table)
+    assert tbl.has_header is True
+    assert tbl.rows == (
+        ((Text("h1"),), (Text("h2"),)),
+        ((Text("a"),), (Text("b"),)),
+    )
+
+
+def test_blocks_table_with_equation_in_cell() -> None:
+    src = "| a | b |\n|---|---|\n| 1 | $x^2$ |"
+    blocks = extract_blocks(src)
+    assert len(blocks) == 1
+    tbl = blocks[0]
+    assert isinstance(tbl, Table)
+    assert tbl.rows[1][1] == (Equation(latex="x^2"),)
+
+
+def test_blocks_table_alignment_marker_ignored() -> None:
+    src = "| a | b |\n|:---|---:|\n| 1 | 2 |"
+    blocks = extract_blocks(src)
+    assert isinstance(blocks[0], Table)
+
+
+def test_blocks_paragraph_table_paragraph() -> None:
+    src = "Intro text.\n\n| h | k |\n|---|---|\n| 1 | 2 |\n\nAfter."
+    blocks = extract_blocks(src)
+    assert len(blocks) == 3
+    assert isinstance(blocks[0], Paragraph) and blocks[0].segments == (Text("Intro text."),)
+    assert isinstance(blocks[1], Table)
+    assert isinstance(blocks[2], Paragraph) and blocks[2].segments == (Text("After."),)
+
+
+def test_blocks_pipe_in_equation_does_not_break_table_detection() -> None:
+    # An equation containing `|` should not be mistaken for a table cell.
+    src = "value $|x|$ here.\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+    blocks = extract_blocks(src)
+    assert len(blocks) == 2
+    assert isinstance(blocks[0], Paragraph)
+    assert any(isinstance(s, Equation) for s in blocks[0].segments)
+    assert isinstance(blocks[1], Table)
+
+
+def test_blocks_malformed_table_falls_back_to_paragraph() -> None:
+    # Missing delimiter row → not a table.
+    src = "| h1 | h2 |\n| a | b |"
+    blocks = extract_blocks(src)
+    assert len(blocks) == 1
+    assert isinstance(blocks[0], Paragraph)
+
+
+def test_blocks_table_with_uneven_rows_pads_to_header() -> None:
+    src = "| h1 | h2 | h3 |\n|---|---|---|\n| 1 | 2 |"
+    blocks = extract_blocks(src)
+    tbl = blocks[0]
+    assert isinstance(tbl, Table)
+    # Header has 3 cols, data row has 2 → padded to 3.
+    assert len(tbl.rows[1]) == 3

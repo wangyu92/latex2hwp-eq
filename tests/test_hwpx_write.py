@@ -10,7 +10,7 @@ from lxml import etree
 
 from hwpx_eq.hwpx_io.ns import HP, NSMAP
 from hwpx_eq.hwpx_io.write import write_from_eqs, write_from_latex, write_mixed
-from hwpx_eq.latex.extract import Equation, Text
+from hwpx_eq.latex.extract import Equation, Paragraph, Table, Text
 
 
 def _read_section_xml(hwpx_path: Path) -> etree._Element:
@@ -173,3 +173,129 @@ def test_write_mixed_text_only(tmp_path: Path) -> None:
     assert len(user_paras) == 1
     eqs = root.findall(f".//{{{HP}}}equation")
     assert eqs == []
+
+
+# -------- write_mixed: tables --------
+
+
+def test_write_mixed_with_table_creates_hp_tbl(tmp_path: Path) -> None:
+    out = tmp_path / "tbl.hwpx"
+    table = Table(
+        rows=(
+            ((Text("h1"),), (Text("h2"),)),
+            ((Text("a"),), (Text("b"),)),
+        ),
+        has_header=True,
+    )
+    write_mixed([table], str(out))
+    root = _read_section_xml(out)
+    tbls = root.findall(f".//{{{HP}}}tbl")
+    assert len(tbls) == 1
+    tcs = tbls[0].findall(f".//{{{HP}}}tc")
+    assert len(tcs) == 4  # 2 rows x 2 cols
+
+
+def test_write_mixed_table_marks_header_row(tmp_path: Path) -> None:
+    out = tmp_path / "tbl_header.hwpx"
+    table = Table(
+        rows=(
+            ((Text("h1"),), (Text("h2"),)),
+            ((Text("a"),), (Text("b"),)),
+        ),
+        has_header=True,
+    )
+    write_mixed([table], str(out))
+    root = _read_section_xml(out)
+    tbl = root.find(f".//{{{HP}}}tbl")
+    rows = tbl.findall(f"{{{HP}}}tr")
+    header_cells = rows[0].findall(f"{{{HP}}}tc")
+    body_cells = rows[1].findall(f"{{{HP}}}tc")
+    assert all(c.get("header") == "1" for c in header_cells)
+    assert all(c.get("header") != "1" for c in body_cells)
+
+
+def test_write_mixed_table_with_equation_cell(tmp_path: Path) -> None:
+    out = tmp_path / "tbl_eq.hwpx"
+    table = Table(
+        rows=(
+            ((Text("a"),), (Equation(r"x^2"),)),
+        ),
+        has_header=False,
+    )
+    write_mixed([table], str(out))
+    root = _read_section_xml(out)
+    cell_eqs = root.findall(f".//{{{HP}}}tc//{{{HP}}}equation")
+    assert len(cell_eqs) == 1
+
+
+def test_write_mixed_table_fills_printable_width(tmp_path: Path) -> None:
+    """Tables should auto-resize to the printable area (page - left - right)."""
+    out = tmp_path / "fit.hwpx"
+    table = Table(
+        rows=(
+            ((Text("h1"),), (Text("h2"),), (Text("h3"),)),
+            ((Text("a"),), (Text("b"),), (Text("c"),)),
+        ),
+        has_header=True,
+    )
+    write_mixed([table], str(out))
+    root = _read_section_xml(out)
+    page_pr = root.find(f"{{{HP}}}p/{{{HP}}}run/{{{HP}}}secPr/{{{HP}}}pagePr")
+    if page_pr is None:
+        # secPr may be elsewhere; fall back to the first pagePr in the section.
+        page_pr = root.find(f".//{{{HP}}}pagePr")
+    assert page_pr is not None
+    page_w = int(page_pr.get("width"))
+    margin = page_pr.find(f"{{{HP}}}margin")
+    printable = page_w - int(margin.get("left")) - int(margin.get("right"))
+
+    tbl = root.find(f".//{{{HP}}}tbl")
+    sz = tbl.find(f"{{{HP}}}sz")
+    assert int(sz.get("width")) == printable
+    # Cell widths in each row sum to the printable width.
+    for tr in tbl.findall(f"{{{HP}}}tr"):
+        cell_widths = [int(c.get("width")) for c in tr.findall(f"{{{HP}}}tc/{{{HP}}}cellSz")]
+        assert sum(cell_widths) == printable
+
+
+def test_write_mixed_table_fills_narrow_page(tmp_path: Path) -> None:
+    """When --page-width shrinks the page, tables should adapt accordingly."""
+    out = tmp_path / "narrow.hwpx"
+    table = Table(rows=(((Text("a"),), (Text("b"),)),), has_header=False)
+    write_mixed([table], str(out), page_width_mm=100.0)
+    root = _read_section_xml(out)
+    page_pr = root.find(f".//{{{HP}}}pagePr")
+    page_w = int(page_pr.get("width"))
+    margin = page_pr.find(f"{{{HP}}}margin")
+    printable = page_w - int(margin.get("left")) - int(margin.get("right"))
+
+    tbl = root.find(f".//{{{HP}}}tbl")
+    sz = tbl.find(f"{{{HP}}}sz")
+    assert int(sz.get("width")) == printable
+
+
+def test_write_mixed_paragraph_table_paragraph_order(tmp_path: Path) -> None:
+    out = tmp_path / "ordered.hwpx"
+    blocks = [
+        Paragraph(segments=(Text("before"),)),
+        Table(rows=(((Text("h"),),), ((Text("v"),),)), has_header=True),
+        Paragraph(segments=(Text("after"),)),
+    ]
+    write_mixed(blocks, str(out))
+    root = _read_section_xml(out)
+    # All top-level <hp:p>: at least 3 user-authored ones in order plus
+    # python-hwpx's placeholder. Verify existence and order of authored chunks
+    # by scanning their text/tbl content.
+    seq: list[str] = []
+    for p in root.findall(f"{{{HP}}}p"):
+        if p.find(f".//{{{HP}}}tbl") is not None:
+            seq.append("table")
+        else:
+            ts = p.findall(f"{{{HP}}}run/{{{HP}}}t")
+            for t in ts:
+                if t.text and t.text.strip():
+                    seq.append(t.text.strip())
+                    break
+    # Filter to only our authored items.
+    authored = [s for s in seq if s in ("before", "after", "table")]
+    assert authored == ["before", "table", "after"]

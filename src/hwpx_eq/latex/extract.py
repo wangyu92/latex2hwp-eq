@@ -1,11 +1,15 @@
-"""Extract LaTeX math fragments from a .tex/.md file.
+"""Extract LaTeX math + GFM tables from a .tex/.md file.
 
-Recognizes (longest-first to avoid `$$` being eaten by `$`):
+Equation markers (longest-first to avoid `$$` being eaten by `$`):
   \\[ ... \\]
   $$ ... $$
   \\( ... \\)
   $ ... $
   \\begin{equation|equation*|align|align*|gather|gather*} ... \\end{...}
+
+Tables: GitHub-flavored markdown pipe tables — header row, `|---|` delimiter,
+zero or more data rows. Alignment markers (`:---`, `---:`, `:---:`) are
+recognized in the delimiter but ignored for output.
 """
 
 from __future__ import annotations
@@ -26,6 +30,9 @@ _PATTERNS = [
 
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n+")
 _INTRA_PARA_WS = re.compile(r"\s+")
+_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_DELIMITER = re.compile(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$")
+_PLACEHOLDER = re.compile("(\\d+)")
 
 
 @dataclass(frozen=True)
@@ -41,57 +48,138 @@ class Equation:
 Segment = Text | Equation
 
 
+@dataclass(frozen=True)
+class Paragraph:
+    """A block of inline segments (text and equations)."""
+    segments: tuple[Segment, ...]
+
+
+@dataclass(frozen=True)
+class Table:
+    """A markdown / HWPX table.
+
+    rows[r][c] is a tuple of inline Segments forming cell (r, c)'s content.
+    """
+    rows: tuple[tuple[tuple[Segment, ...], ...], ...]
+    has_header: bool
+
+
+Block = Paragraph | Table
+
+
 def extract(text: str) -> list[str]:
     """Return all math fragments in the given text, in document order."""
     return [latex for _, _, latex in _equation_spans(text)]
 
 
-def extract_segments(text: str) -> list[list[Segment]]:
-    """Split text into paragraphs of Text/Equation segments.
+def extract_blocks(text: str) -> list[Block]:
+    """Parse text into a sequence of Paragraph and Table blocks.
 
-    Paragraphs are separated by blank lines (`\\n\\s*\\n+`). Within a
-    paragraph, runs of whitespace (including single newlines) collapse to a
-    single space. Leading/trailing whitespace at paragraph boundaries is
-    stripped. Equations preserve their LaTeX exactly.
+    Equations are protected with placeholders before block detection so a `|`
+    appearing inside an equation (e.g. `|x|`) doesn't trigger table parsing.
     """
-    spans = _equation_spans(text)
+    placeholder_text, ph_map = _replace_equations_with_placeholders(text)
+    chunks = _PARAGRAPH_BREAK.split(placeholder_text)
+    blocks: list[Block] = []
+    for chunk in chunks:
+        chunk = chunk.strip("\n")
+        if not chunk.strip():
+            continue
+        table = _try_parse_md_table(chunk, ph_map)
+        if table is not None:
+            blocks.append(table)
+            continue
+        segs = _placeholder_text_to_segments(chunk, ph_map)
+        if segs:
+            blocks.append(Paragraph(segments=tuple(segs)))
+    return blocks
 
-    # Build a flat list of ('text'|'eq', payload) interleaved.
-    flat: list[tuple[str, str]] = []
+
+def _replace_equations_with_placeholders(text: str) -> tuple[str, dict[str, str]]:
+    spans = _equation_spans(text)
+    ph_map: dict[str, str] = {}
+    parts: list[str] = []
     cursor = 0
     for start, end, latex in spans:
         if start > cursor:
-            flat.append(("text", text[cursor:start]))
-        flat.append(("eq", latex))
+            parts.append(text[cursor:start])
+        ph = f"{len(ph_map)}"
+        ph_map[ph] = latex
+        parts.append(ph)
         cursor = end
     if cursor < len(text):
-        flat.append(("text", text[cursor:]))
+        parts.append(text[cursor:])
+    return "".join(parts), ph_map
 
-    paragraphs: list[list[Segment]] = []
-    current: list[Segment] = []
 
-    def close_paragraph() -> None:
-        nonlocal current
-        stripped = _strip_outer_text_whitespace(current)
-        if stripped:
-            paragraphs.append(stripped)
-        current = []
+def _try_parse_md_table(chunk: str, ph_map: dict[str, str]) -> Table | None:
+    lines = chunk.splitlines()
+    if len(lines) < 2:
+        return None
+    if not all(_TABLE_ROW.match(line) for line in lines):
+        return None
+    if not _TABLE_DELIMITER.match(lines[1]):
+        return None
+    header_cells = _split_md_row(lines[0])
+    cols = len(header_cells)
+    rows: list[tuple[tuple[Segment, ...], ...]] = []
+    rows.append(_row_to_cells(header_cells, ph_map, cols))
+    for line in lines[2:]:
+        cells = _split_md_row(line)
+        rows.append(_row_to_cells(cells, ph_map, cols))
+    return Table(rows=tuple(rows), has_header=True)
 
-    for kind, content in flat:
-        if kind == "eq":
-            current.append(Equation(latex=content))
-            continue
-        # Split text on blank-line boundaries; each odd-indexed part is a separator.
-        parts = _PARAGRAPH_BREAK.split(content)
-        for i, part in enumerate(parts):
-            cleaned = _INTRA_PARA_WS.sub(" ", part)
+
+def _row_to_cells(
+    raw_cells: list[str], ph_map: dict[str, str], cols: int
+) -> tuple[tuple[Segment, ...], ...]:
+    # Pad/trim to header column count so all rows are rectangular.
+    cells = (raw_cells + [""] * cols)[:cols]
+    return tuple(
+        tuple(_placeholder_text_to_segments(cell, ph_map)) for cell in cells
+    )
+
+
+def _split_md_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _placeholder_text_to_segments(
+    text: str, ph_map: dict[str, str]
+) -> list[Segment]:
+    """Re-expand placeholders into Equation segments and collapse whitespace
+    in the surrounding text. Trims leading/trailing whitespace.
+    """
+    out: list[Segment] = []
+    cursor = 0
+    for m in _PLACEHOLDER.finditer(text):
+        if m.start() > cursor:
+            chunk = text[cursor : m.start()]
+            for piece in _split_text_on_paragraph_breaks(chunk):
+                cleaned = _INTRA_PARA_WS.sub(" ", piece)
+                if cleaned:
+                    out.append(Text(content=cleaned))
+        out.append(Equation(latex=ph_map[m.group(0)]))
+        cursor = m.end()
+    if cursor < len(text):
+        chunk = text[cursor:]
+        for piece in _split_text_on_paragraph_breaks(chunk):
+            cleaned = _INTRA_PARA_WS.sub(" ", piece)
             if cleaned:
-                current.append(Text(content=cleaned))
-            if i < len(parts) - 1:
-                close_paragraph()
+                out.append(Text(content=cleaned))
+    return _strip_outer_text_whitespace(out)
 
-    close_paragraph()
-    return paragraphs
+
+def _split_text_on_paragraph_breaks(s: str) -> list[str]:
+    # Within a chunk passed here we should not have paragraph breaks (callers
+    # split by them earlier). But callers from cells pass cell text which has
+    # no breaks anyway. This keeps a single code path safe.
+    return _PARAGRAPH_BREAK.split(s)
 
 
 def _equation_spans(text: str) -> list[tuple[int, int, str]]:
@@ -118,3 +206,16 @@ def _strip_outer_text_whitespace(segs: list[Segment]) -> list[Segment]:
 
 def _overlaps(a_s: int, a_e: int, b_s: int, b_e: int) -> bool:
     return a_s < b_e and b_s < a_e
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat: callers that still use `extract_segments` (paragraphs only).
+
+
+def extract_segments(text: str) -> list[list[Segment]]:
+    """Deprecated: use `extract_blocks`. Returns paragraph blocks as nested
+    lists of Segment, dropping any tables. Kept temporarily so older callers
+    keep working during the migration.
+    """
+    blocks = extract_blocks(text)
+    return [list(b.segments) for b in blocks if isinstance(b, Paragraph)]

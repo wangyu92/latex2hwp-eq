@@ -9,9 +9,12 @@ from hwpx_eq import __version__
 from hwpx_eq.hwpx_io.read import read_latex, read_mixed
 from hwpx_eq.hwpx_io.write import write_from_latex, write_mixed
 from hwpx_eq.latex.extract import (
+    Block,
     Equation,
+    Paragraph,
+    Table,
     Text,
-    extract_segments,
+    extract_blocks,
 )
 from hwpx_eq.latex.extract import (
     extract as extract_latex_math,
@@ -63,16 +66,19 @@ def tex2hwpx_cmd(
     page_note = f", {page_width:g}mm wide" if page_width else ""
 
     if mode == "mixed":
-        paragraphs = extract_segments(text)
-        if not paragraphs:
+        blocks = extract_blocks(text)
+        if not blocks:
             raise click.ClickException("input is empty")
         write_mixed(
-            paragraphs, str(output), font_size_pt=font_size, page_width_mm=page_width
+            blocks, str(output), font_size_pt=font_size, page_width_mm=page_width
         )
-        n_eq = sum(1 for p in paragraphs for s in p if isinstance(s, Equation))
+        n_para = sum(1 for b in blocks if isinstance(b, Paragraph))
+        n_table = sum(1 for b in blocks if isinstance(b, Table))
+        n_eq = _count_equations(blocks)
+        table_note = f", {n_table} table(s)" if n_table else ""
         click.echo(
-            f"wrote {len(paragraphs)} paragraph(s), {n_eq} equation(s) at {font_size}pt"
-            f"{page_note} -> {output}"
+            f"wrote {n_para} paragraph(s){table_note}, {n_eq} equation(s)"
+            f" at {font_size}pt{page_note} -> {output}"
         )
         return
 
@@ -109,11 +115,13 @@ def hwpx2tex_cmd(
 ) -> None:
     """Extract LaTeX (and optionally surrounding text) from a .hwpx file."""
     if mode == "mixed":
-        paragraphs = read_mixed(str(input_path))
-        body = _format_mixed(paragraphs, out_format)
-        n_para = len(paragraphs)
-        n_eq = sum(1 for p in paragraphs for s in p if isinstance(s, Equation))
-        summary = f"{n_para} paragraph(s), {n_eq} equation(s)"
+        blocks = read_mixed(str(input_path))
+        body = _format_mixed(blocks, out_format)
+        n_para = sum(1 for b in blocks if isinstance(b, Paragraph))
+        n_table = sum(1 for b in blocks if isinstance(b, Table))
+        n_eq = _count_equations(blocks)
+        table_note = f", {n_table} table(s)" if n_table else ""
+        summary = f"{n_para} paragraph(s){table_note}, {n_eq} equation(s)"
     else:
         eqs = read_latex(str(input_path))
         if out_format == "md":
@@ -131,28 +139,93 @@ def hwpx2tex_cmd(
         click.echo(f"wrote {summary} -> {output}")
 
 
-def _format_mixed(paragraphs: list[list], out_format: str) -> str:
-    """Render mixed-mode paragraphs. Display equations get block delimiters;
-    inline equations (paragraph mixes text with at least one equation) get
-    inline delimiters. Plain mode uses bare LaTeX with no delimiters.
+def _format_mixed(blocks: list[Block], out_format: str) -> str:
+    """Render Block list as md/tex/plain text.
+
+    Display equations (paragraph with only one equation) get block delimiters;
+    inline equations get inline delimiters. Tables become GFM pipe tables in
+    md/plain output and a same-shape table in tex output (still pipe form).
+    Plain mode emits bare LaTeX without `$...$` markers.
     """
-    out_paragraphs: list[str] = []
-    for para in paragraphs:
-        only_eq = len(para) == 1 and isinstance(para[0], Equation)
+    rendered: list[str] = []
+    for block in blocks:
+        if isinstance(block, Paragraph):
+            rendered.append(_format_paragraph(block, out_format))
+        elif isinstance(block, Table):
+            rendered.append(_format_table(block, out_format))
+    return "\n\n".join(rendered)
+
+
+def _format_paragraph(para: Paragraph, out_format: str) -> str:
+    only_eq = len(para.segments) == 1 and isinstance(para.segments[0], Equation)
+    parts: list[str] = []
+    for seg in para.segments:
+        if isinstance(seg, Text):
+            parts.append(seg.content)
+            continue
+        if out_format == "plain":
+            parts.append(seg.latex)
+        elif out_format == "tex":
+            parts.append(f"\\[{seg.latex}\\]" if only_eq else f"\\({seg.latex}\\)")
+        else:  # md
+            parts.append(f"$${seg.latex}$$" if only_eq else f"${seg.latex}$")
+    return "".join(parts)
+
+
+def _format_table(table: Table, out_format: str) -> str:
+    """Emit a GFM pipe table. Cells render their inline segments — equations
+    always get inline delimiters since cells can't host display math.
+    """
+    if not table.rows:
+        return ""
+
+    def cell_text(cell_segs: tuple) -> str:
         parts: list[str] = []
-        for seg in para:
+        for seg in cell_segs:
             if isinstance(seg, Text):
                 parts.append(seg.content)
-                continue
-            # Equation
-            if out_format == "plain":
-                parts.append(seg.latex)
-            elif out_format == "tex":
-                parts.append(f"\\[{seg.latex}\\]" if only_eq else f"\\({seg.latex}\\)")
-            else:  # md
-                parts.append(f"$${seg.latex}$$" if only_eq else f"${seg.latex}$")
-        out_paragraphs.append("".join(parts))
-    return "\n\n".join(out_paragraphs)
+            else:  # Equation
+                if out_format == "plain":
+                    parts.append(seg.latex)
+                elif out_format == "tex":
+                    parts.append(f"\\({seg.latex}\\)")
+                else:
+                    parts.append(f"${seg.latex}$")
+        return " ".join(p.strip() for p in parts).strip() or " "
+
+    cols = max(len(r) for r in table.rows)
+    rows_text: list[list[str]] = []
+    for row in table.rows:
+        cells = [cell_text(row[c]) if c < len(row) else " " for c in range(cols)]
+        rows_text.append(cells)
+
+    # GFM requires a header row. If the source has none, emit a blank one.
+    if table.has_header:
+        header = rows_text[0]
+        body_rows = rows_text[1:]
+    else:
+        header = [" "] * cols
+        body_rows = rows_text
+
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "|" + "|".join(["---"] * cols) + "|",
+    ]
+    for row in body_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def _count_equations(blocks: list[Block]) -> int:
+    n = 0
+    for block in blocks:
+        if isinstance(block, Paragraph):
+            n += sum(1 for s in block.segments if isinstance(s, Equation))
+        elif isinstance(block, Table):
+            for row in block.rows:
+                for cell in row:
+                    n += sum(1 for s in cell if isinstance(s, Equation))
+    return n
 
 
 if __name__ == "__main__":
